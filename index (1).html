@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<meta name="theme-color" content="#0F1117"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="Barber Oil"/>
+<title>Barber Oil Invoicing</title>
+<link href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&display=swap" rel="stylesheet"/>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0F1117;font-family:'Courier Prime','Courier New',monospace;color:#E8E6E1;overflow-x:hidden}
+input,select,textarea,button{font-family:inherit}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:#1A1D27}
+::-webkit-scrollbar-thumb{background:#2D3348;border-radius:2px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel">
+const{useState,useEffect,useRef,useCallback}=React;
+
+// Database Layer
+const DB_NAME="BarberOilDB";
+const DB_VERSION=3;
+
+function openDB(){
+  return new Promise((resolve,reject)=>{
+    const request=indexedDB.open(DB_NAME,DB_VERSION);
+    request.onupgradeneeded=(e)=>{
+      const db=e.target.result;
+      if(!db.objectStoreNames.contains("customers")){
+        const cs=db.createObjectStore("customers",{keyPath:"accountNumber"});
+        cs.createIndex("name","name",{unique:false});
+      }
+      if(!db.objectStoreNames.contains("products")){
+        db.createObjectStore("products",{keyPath:"id"});
+      }
+      if(!db.objectStoreNames.contains("invoices")){
+        const inv=db.createObjectStore("invoices",{keyPath:"invoiceNumber"});
+        inv.createIndex("customerId","customerId",{unique:false});
+        inv.createIndex("date","date",{unique:false});
+        inv.createIndex("driverId","driverId",{unique:false});
+      }
+      if(!db.objectStoreNames.contains("users")){
+        db.createObjectStore("users",{keyPath:"id"});
+      }
+      if(!db.objectStoreNames.contains("settings")){
+        db.createObjectStore("settings",{keyPath:"key"});
+      }
+    };
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error);
+  });
+}
+
+async function dbGet(store,key){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction(store,"readonly");
+    const req=tx.objectStore(store).get(key);
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error);
+  });
+}
+
+async function dbGetAll(store){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction(store,"readonly");
+    const req=tx.objectStore(store).getAll();
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error);
+  });
+}
+
+async function dbPut(store,data){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction(store,"readwrite");
+    tx.objectStore(store).put(data);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  });
+}
+
+async function dbDelete(store,key){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction(store,"readwrite");
+    tx.objectStore(store).delete(key);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  });
+}
+
+async function dbClear(store){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction(store,"readwrite");
+    tx.objectStore(store).clear();
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  });
+}
+
+// Default Data
+const DEFAULT_PRODUCTS=[
+  {id:"REG87",name:"Regular Gasoline 87 Octane (No Ethanol)",shortName:"Reg 87 No-Eth",pricePerGallon:0,taxable:false},
+  {id:"PLUS90",name:"Unleaded Plus 90 Octane (No Ethanol)",shortName:"Plus 90 No-Eth",pricePerGallon:0,taxable:false},
+  {id:"ULSD",name:"Clear ULSD",shortName:"Clear ULSD",pricePerGallon:0,taxable:false},
+  {id:"REGETH",name:"Unleaded Regular (With Ethanol)",shortName:"Reg w/ Ethanol",pricePerGallon:0,taxable:false},
+  {id:"DYED",name:"Dyed Diesel (Off-Road Use Only)",shortName:"Dyed Diesel",pricePerGallon:0,taxable:true},
+  {id:"KERO",name:"Kerosene",shortName:"Kerosene",pricePerGallon:0,taxable:false},
+];
+
+const DEFAULT_USERS=[
+  {id:"admin",name:"Admin",pin:"1234",role:"admin"},
+  {id:"driver1",name:"Driver 1",pin:"1111",role:"driver"},
+];
+
+const TAX_RATE=0.07;
+
+// Utility
+function generateInvoiceNumber(){
+  const d=new Date();
+  const yr=d.getFullYear().toString().slice(2);
+  const mo=String(d.getMonth()+1).padStart(2,"0");
+  const dy=String(d.getDate()).padStart(2,"0");
+  const rand=Math.floor(Math.random()*9000+1000);
+  return "BO-"+yr+mo+dy+"-"+rand;
+}
+
+function formatCurrency(n){return "$"+Number(n||0).toFixed(2)}
+
+function formatDate(d){
+  if(!d)return "";
+  const date=new Date(d);
+  return date.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
+}
+
+function formatDateTime(d){
+  if(!d)return "";
+  const date=new Date(d);
+  return date.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit"});
+}
+
+// Colors
+const C={
+  bg:"#0F1117",sf:"#1A1D27",sa:"#222633",bd:"#2D3348",bl:"#3A4060",
+  pr:"#D4A44C",pd:"#B8882E",pl:"#E8C87A",ac:"#C44B2C",al:"#E8633F",
+  tx:"#E8E6E1",tm:"#9B9DAB",td:"#6B6D7B",ok:"#3B9B6A",wn:"#D4A44C",
+  dn:"#C44B2C",wh:"#FFFFFF",
+};
+
+// Styles
+const S={
+  app:{fontFamily:"'Courier Prime','Courier New',monospace",background:C.bg,color:C.tx,minHeight:"100vh",maxWidth:480,margin:"0 auto",position:"relative",paddingBottom:80},
+  hdr:{background:"linear-gradient(135deg,"+C.sf+" 0%,#1E2130 100%)",borderBottom:"2px solid "+C.pr,padding:"16px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100},
+  hdrT:{fontSize:18,fontWeight:700,color:C.pr,letterSpacing:2,textTransform:"uppercase"},
+  hdrS:{fontSize:10,color:C.tm,letterSpacing:3,textTransform:"uppercase",marginTop:2},
+  nav:{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,background:C.sf,borderTop:"1px solid "+C.bd,display:"flex",justifyContent:"space-around",padding:"8px 0 12px",zIndex:100},
+  card:{background:C.sf,border:"1px solid "+C.bd,borderRadius:8,margin:"12px 16px",padding:16},
+  cardT:{fontSize:11,letterSpacing:2,textTransform:"uppercase",color:C.pr,marginBottom:12,fontWeight:700},
+  inp:{width:"100%",background:C.sa,border:"1px solid "+C.bd,borderRadius:6,padding:"12px 14px",color:C.tx,fontSize:15,fontFamily:"inherit",outline:"none",boxSizing:"border-box",marginBottom:10},
+  lbl:{fontSize:10,letterSpacing:1.5,textTransform:"uppercase",color:C.tm,marginBottom:4,display:"block"},
+  sel:{width:"100%",background:C.sa,border:"1px solid "+C.bd,borderRadius:6,padding:"12px 14px",color:C.tx,fontSize:15,fontFamily:"inherit",outline:"none",boxSizing:"border-box",marginBottom:10,appearance:"none"},
+  row:{display:"flex",gap:10,marginBottom:10},
+  f1:{flex:1},
+  div:{borderTop:"1px solid "+C.bd,margin:"12px 0"},
+  sigCanvas:{width:"100%",height:120,background:C.sa,border:"1px solid "+C.bd,borderRadius:6,cursor:"crosshair",touchAction:"none"},
+};
+
+function btn(v){
+  const base={width:"100%",padding:"14px 20px",borderRadius:6,border:"none",fontSize:13,fontWeight:700,letterSpacing:2,textTransform:"uppercase",cursor:"pointer",fontFamily:"inherit",transition:"all 0.2s"};
+  if(v==="primary")return{...base,background:C.pr,color:C.bg};
+  if(v==="danger")return{...base,background:C.dn,color:C.wh};
+  if(v==="outline")return{...base,background:"transparent",color:C.pr,border:"1px solid "+C.pr};
+  if(v==="ghost")return{...base,background:"transparent",color:C.tm};
+  if(v==="success")return{...base,background:C.ok,color:C.wh};
+  return base;
+}
+
+function badge(color){return{display:"inline-block",padding:"3px 8px",borderRadius:4,fontSize:10,fontWeight:700,letterSpacing:1,textTransform:"uppercase",background:color+"22",color:color,fontFamily:"inherit"}}
+
+function navItem(active){return{display:"flex",flexDirection:"column",alignItems:"center",gap:2,padding:"6px 12px",cursor:"pointer",color:active?C.pr:C.td,fontSize:10,letterSpacing:1,textTransform:"uppercase",background:"none",border:"none",fontFamily:"inherit",transition:"color 0.2s"}}
+
+// Icons
+function Ic({name,size=22,color="currentColor"}){
+  const p={stroke:color,strokeWidth:"1.5",fill:"none"};
+  const p2={stroke:color,strokeWidth:"2",fill:"none"};
+  const icons={
+    invoice:<><rect x="4" y="2" width="16" height="20" rx="2" {...p}/><line x1="8" y1="7" x2="16" y2="7" {...p}/><line x1="8" y1="11" x2="16" y2="11" {...p}/><line x1="8" y1="15" x2="12" y2="15" {...p}/></>,
+    customers:<><circle cx="12" cy="8" r="3.5" {...p}/><path d="M4 20c0-3.5 3.5-6 8-6s8 2.5 8 6" {...p}/></>,
+    products:<><path d="M12 2L3 7v10l9 5 9-5V7z" {...p}/><path d="M12 12L3 7" {...p}/><path d="M12 12l9-5" {...p}/><path d="M12 12v10" {...p}/></>,
+    history:<><circle cx="12" cy="12" r="9" {...p}/><polyline points="12,7 12,12 16,14" {...p}/></>,
+    dashboard:<><rect x="3" y="3" width="7" height="7" rx="1" {...p}/><rect x="14" y="3" width="7" height="7" rx="1" {...p}/><rect x="3" y="14" width="7" height="7" rx="1" {...p}/><rect x="14" y="14" width="7" height="7" rx="1" {...p}/></>,
+    settings:<><circle cx="12" cy="12" r="3" {...p}/><path d="M12 1v3M12 20v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M1 12h3M20 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12" {...p}/></>,
+    plus:<><line x1="12" y1="5" x2="12" y2="19" {...p2}/><line x1="5" y1="12" x2="19" y2="12" {...p2}/></>,
+    back:<><polyline points="15,18 9,12 15,6" {...p2}/></>,
+    logout:<><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4" {...p}/><polyline points="16,17 21,12 16,7" {...p}/><line x1="21" y1="12" x2="9" y2="12" {...p}/></>,
+    trash:<><polyline points="3,6 5,6 21,6" {...p}/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" {...p}/></>,
+    check:<><polyline points="20,6 9,17 4,12" {...p2}/></>,
+    edit:<><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" {...p}/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" {...p}/></>,
+    fuel:<><path d="M3 22V6a2 2 0 012-2h8a2 2 0 012 2v16" {...p}/><path d="M15 10h2a2 2 0 012 2v3a2 2 0 002 2v0a2 2 0 002-2V8l-3-3" {...p}/><rect x="6" y="8" width="6" height="4" {...p}/></>,
+    upload:<><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" {...p}/><polyline points="17,8 12,3 7,8" {...p}/><line x1="12" y1="3" x2="12" y2="15" {...p}/></>,
+  };
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none">{icons[name]}</svg>;
+}
+
+// Signature Pad
+function SignaturePad({value,onChange}){
+  const canvasRef=useRef(null);
+  const[drawing,setDrawing]=useState(false);
+  const getPos=(e)=>{const rect=canvasRef.current.getBoundingClientRect();const touch=e.touches?e.touches[0]:e;return{x:touch.clientX-rect.left,y:touch.clientY-rect.top}};
+  const startDraw=(e)=>{e.preventDefault();const ctx=canvasRef.current.getContext("2d");const pos=getPos(e);ctx.beginPath();ctx.moveTo(pos.x,pos.y);setDrawing(true)};
+  const draw=(e)=>{e.preventDefault();if(!drawing)return;const ctx=canvasRef.current.getContext("2d");const pos=getPos(e);ctx.lineTo(pos.x,pos.y);ctx.strokeStyle=C.tx;ctx.lineWidth=2;ctx.lineCap="round";ctx.stroke()};
+  const endDraw=(e)=>{e.preventDefault();setDrawing(false);if(canvasRef.current)onChange(canvasRef.current.toDataURL())};
+  const clearSig=()=>{const canvas=canvasRef.current;canvas.getContext("2d").clearRect(0,0,canvas.width,canvas.height);onChange("")};
+  useEffect(()=>{const canvas=canvasRef.current;canvas.width=canvas.offsetWidth;canvas.height=canvas.offsetHeight},[]);
+  return <div>
+    <canvas ref={canvasRef} style={S.sigCanvas} onMouseDown={startDraw} onMouseMove={draw} onMouseUp={endDraw} onMouseLeave={endDraw} onTouchStart={startDraw} onTouchMove={draw} onTouchEnd={endDraw}/>
+    <button style={{...btn("ghost"),padding:"8px",marginTop:4,fontSize:10}} onClick={clearSig}>Clear Signature</button>
+  </div>;
+}
+
+// CSV Parser
+function parseCSV(text){
+  const lines=text.split("\n").filter(l=>l.trim());
+  if(lines.length<2)return[];
+  const headers=lines[0].split(",").map(h=>h.trim().toLowerCase().replace(/[^a-z0-9]/g,""));
+  const rows=[];
+  for(let i=1;i<lines.length;i++){
+    const vals=lines[i].split(",").map(v=>v.trim().replace(/^"|"$/g,""));
+    const obj={};
+    headers.forEach((h,idx)=>{obj[h]=vals[idx]||""});
+    rows.push(obj);
+  }
+  return rows;
+}
+
+function mapCSVToCustomer(row){
+  return{
+    accountNumber:row.accountnumber||row.account||row.acctno||row.id||("IMP-"+Math.random().toString(36).slice(2,8)),
+    name:row.name||row.customername||row.customer||"",
+    address:row.address||row.street||"",
+    city:row.city||"",state:row.state||"",zip:row.zip||row.zipcode||row.postalcode||"",
+    phone:row.phone||row.telephone||row.tel||"",
+    email:row.email||row.emailaddress||"",
+    taxExempt:(row.taxexempt||row.exempt||"").toLowerCase()==="yes"||(row.taxexempt||row.exempt||"").toLowerCase()==="true",
+    notes:row.notes||"",
+  };
+}
+
+// Toast
+function Toast({message,show}){
+  return <div style={{position:"fixed",top:20,left:"50%",transform:"translateX(-50%) translateY("+(show?0:-100)+"px)",background:C.ok,color:C.wh,padding:"12px 24px",borderRadius:8,fontSize:13,fontWeight:700,letterSpacing:1,zIndex:999,transition:"transform 0.3s ease",fontFamily:"inherit",textTransform:"uppercase"}}>{message}</div>;
+}
+
+// ═══ MAIN APP ═══
+function BarberOilApp(){
+  const[ready,setReady]=useState(false);
+  const[user,setUser]=useState(null);
+  const[page,setPage]=useState("invoice");
+  const[subPage,setSubPage]=useState(null);
+  const[customers,setCustomers]=useState([]);
+  const[products,setProducts]=useState([]);
+  const[invoices,setInvoices]=useState([]);
+  const[users,setUsers]=useState([]);
+  const[toast,setToast]=useState({show:false,message:""});
+  const[online,setOnline]=useState(navigator.onLine);
+
+  const showToast=(message)=>{setToast({show:true,message});setTimeout(()=>setToast({show:false,message:""}),2500)};
+
+  useEffect(()=>{
+    async function init(){
+      const prods=await dbGetAll("products");
+      if(prods.length===0){for(const p of DEFAULT_PRODUCTS)await dbPut("products",p)}
+      const usrs=await dbGetAll("users");
+      if(usrs.length===0){for(const u of DEFAULT_USERS)await dbPut("users",u)}
+      await refreshData();
+      setReady(true);
+    }
+    init();
+    window.addEventListener("online",()=>setOnline(true));
+    window.addEventListener("offline",()=>setOnline(false));
+  },[]);
+
+  const refreshData=async()=>{
+    setCustomers(await dbGetAll("customers"));
+    setProducts(await dbGetAll("products"));
+    setInvoices(await dbGetAll("invoices"));
+    setUsers(await dbGetAll("users"));
+  };
+
+  if(!user)return <LoginScreen users={users} onLogin={setUser} ready={ready}/>;
+
+  const navItems=[
+    {id:"invoice",icon:"invoice",label:"New"},
+    {id:"history",icon:"history",label:"History"},
+    {id:"customers",icon:"customers",label:"Customers"},
+    ...(user.role==="admin"?[
+      {id:"products",icon:"products",label:"Products"},
+      {id:"dashboard",icon:"dashboard",label:"Dashboard"},
+      {id:"settings",icon:"settings",label:"Settings"},
+    ]:[]),
+  ];
+
+  return <div style={S.app}>
+    <Toast message={toast.message} show={toast.show}/>
+    <div style={S.hdr}>
+      <div>
+        {subPage?<button style={{background:"none",border:"none",cursor:"pointer",color:C.pr,padding:0}} onClick={()=>setSubPage(null)}><Ic name="back" size={20} color={C.pr}/></button>
+        :<><div style={S.hdrT}>Barber Oil</div><div style={S.hdrS}>Hohenwald, Tennessee</div></>}
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:12}}>
+        <span style={{fontSize:10,color:C.tm,display:"flex",alignItems:"center"}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:online?C.ok:C.dn,display:"inline-block",marginRight:6}}/>{online?"Online":"Offline"}
+        </span>
+        <span style={{fontSize:10,color:C.td}}>{user.name}</span>
+        <button style={{background:"none",border:"none",cursor:"pointer",padding:0}} onClick={()=>setUser(null)}><Ic name="logout" size={18} color={C.td}/></button>
+      </div>
+    </div>
+
+    {page==="invoice"&&<InvoicePage customers={customers} products={products} user={user} onSave={async(inv)=>{await dbPut("invoices",inv);await refreshData();showToast("Invoice saved!")}}/>}
+    {page==="history"&&<HistoryPage invoices={invoices} subPage={subPage} setSubPage={setSubPage}/>}
+    {page==="customers"&&<CustomersPage customers={customers} onRefresh={refreshData} showToast={showToast} subPage={subPage} setSubPage={setSubPage} isAdmin={user.role==="admin"}/>}
+    {page==="products"&&user.role==="admin"&&<ProductsPage products={products} onRefresh={refreshData} showToast={showToast}/>}
+    {page==="dashboard"&&user.role==="admin"&&<DashboardPage invoices={invoices} products={products} customers={customers} users={users}/>}
+    {page==="settings"&&user.role==="admin"&&<SettingsPage users={users} onRefresh={refreshData} showToast={showToast}/>}
+
+    <div style={S.nav}>
+      {navItems.map(n=><button key={n.id} style={navItem(page===n.id)} onClick={()=>{setPage(n.id);setSubPage(null)}}><Ic name={n.icon} size={20}/><span>{n.label}</span></button>)}
+    </div>
+  </div>;
+}
+
+// ═══ LOGIN ═══
+function LoginScreen({users,onLogin,ready}){
+  const[pin,setPin]=useState("");
+  const[selectedUser,setSelectedUser]=useState("");
+  const[error,setError]=useState("");
+  const handleLogin=()=>{const u=users.find(u=>u.id===selectedUser&&u.pin===pin);if(u){onLogin(u);setError("")}else{setError("Invalid PIN");setPin("")}};
+
+  return <div style={{...S.app,display:"flex",flexDirection:"column",justifyContent:"center",minHeight:"100vh",padding:24}}>
+    <div style={{textAlign:"center",marginBottom:40}}>
+      <div style={{display:"inline-flex",alignItems:"center",justifyContent:"center",width:64,height:64,borderRadius:16,background:C.pr+"22",marginBottom:16}}><Ic name="fuel" size={32} color={C.pr}/></div>
+      <div style={{fontSize:28,fontWeight:700,color:C.pr,letterSpacing:4,textTransform:"uppercase"}}>Barber Oil</div>
+      <div style={{fontSize:11,color:C.tm,letterSpacing:3,marginTop:4,textTransform:"uppercase"}}>Hohenwald, Tennessee</div>
+    </div>
+    {!ready?<div style={{textAlign:"center",color:C.td}}>Loading...</div>
+    :<div style={S.card}>
+      <div style={S.cardT}>Driver Login</div>
+      <label style={S.lbl}>Select Driver</label>
+      <select style={S.sel} value={selectedUser} onChange={e=>setSelectedUser(e.target.value)}>
+        <option value="">-- Select --</option>
+        {users.map(u=><option key={u.id} value={u.id}>{u.name} ({u.role})</option>)}
+      </select>
+      <label style={S.lbl}>PIN</label>
+      <input style={S.inp} type="password" maxLength={6} placeholder="Enter PIN" value={pin} onChange={e=>setPin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleLogin()}/>
+      {error&&<div style={{color:C.dn,fontSize:12,marginBottom:10}}>{error}</div>}
+      <button style={btn("primary")} onClick={handleLogin}>Login</button>
+    </div>}
+  </div>;
+}
+
+// ═══ INVOICE PAGE ═══
+function InvoicePage({customers,products,user,onSave}){
+  const emptyInv=()=>({
+    invoiceNumber:generateInvoiceNumber(),date:new Date().toISOString(),driverId:user.id,driverName:user.name,
+    customerId:"",customerName:"",customerAddress:"",customerPhone:"",customerEmail:"",customerTaxExempt:false,
+    lineItems:[],subtotal:0,taxTotal:0,grandTotal:0,
+    poNumber:"",ticketNumber:"",tankReadingBefore:"",tankReadingAfter:"",deliveryNotes:"",signature:"",
+    paymentStatus:"invoice",paymentMethod:"",paymentRef:"",status:"draft",
+  });
+
+  const[inv,setInv]=useState(emptyInv());
+  const[customerSearch,setCustomerSearch]=useState("");
+  const[showCL,setShowCL]=useState(false);
+  const[showAL,setShowAL]=useState(false);
+  const[nl,setNL]=useState({productId:"",gallons:"",priceOverride:""});
+
+  const filtered=customers.filter(c=>c.name.toLowerCase().includes(customerSearch.toLowerCase())||c.accountNumber.toLowerCase().includes(customerSearch.toLowerCase()));
+
+  const selectCustomer=(c)=>{
+    setInv(p=>({...p,customerId:c.accountNumber,customerName:c.name,customerAddress:[c.address,c.city,c.state,c.zip].filter(Boolean).join(", "),customerPhone:c.phone,customerEmail:c.email,customerTaxExempt:c.taxExempt}));
+    setShowCL(false);setCustomerSearch("");
+  };
+
+  const addLineItem=()=>{
+    const prod=products.find(p=>p.id===nl.productId);
+    if(!prod||!nl.gallons)return;
+    const gallons=parseFloat(nl.gallons);
+    const price=nl.priceOverride?parseFloat(nl.priceOverride):prod.pricePerGallon;
+    const lineTotal=gallons*price;
+    const taxable=prod.taxable&&!inv.customerTaxExempt;
+    const lineTax=taxable?lineTotal*TAX_RATE:0;
+    const item={id:Date.now().toString(),productId:prod.id,productName:prod.shortName,gallons,pricePerGallon:price,lineTotal,taxable,lineTax};
+    const newItems=[...inv.lineItems,item];
+    const subtotal=newItems.reduce((s,i)=>s+i.lineTotal,0);
+    const taxTotal=newItems.reduce((s,i)=>s+i.lineTax,0);
+    setInv(p=>({...p,lineItems:newItems,subtotal,taxTotal,grandTotal:subtotal+taxTotal}));
+    setNL({productId:"",gallons:"",priceOverride:""});setShowAL(false);
+  };
+
+  const removeLineItem=(id)=>{
+    const newItems=inv.lineItems.filter(i=>i.id!==id);
+    const subtotal=newItems.reduce((s,i)=>s+i.lineTotal,0);
+    const taxTotal=newItems.reduce((s,i)=>s+i.lineTax,0);
+    setInv(p=>({...p,lineItems:newItems,subtotal,taxTotal,grandTotal:subtotal+taxTotal}));
+  };
+
+  const handleSave=async()=>{
+    if(!inv.customerId){alert("Please select a customer");return}
+    if(inv.lineItems.length===0){alert("Please add at least one product");return}
+    await onSave({...inv,date:new Date().toISOString(),status:"completed"});
+    setInv(emptyInv());
+  };
+
+  return <div>
+    {/* Invoice # & Date */}
+    <div style={S.card}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div><div style={{fontSize:10,color:C.td,letterSpacing:1,textTransform:"uppercase"}}>Invoice</div><div style={{fontSize:16,fontWeight:700,color:C.pr}}>{inv.invoiceNumber}</div></div>
+        <div style={{textAlign:"right"}}><div style={{fontSize:10,color:C.td,letterSpacing:1,textTransform:"uppercase"}}>Date</div><div style={{fontSize:13,color:C.tx}}>{formatDate(inv.date)}</div></div>
+      </div>
+    </div>
+
+    {/* Customer */}
+    <div style={S.card}>
+      <div style={S.cardT}>Customer</div>
+      {inv.customerId?<div>
+        <div style={{fontSize:15,fontWeight:700,color:C.tx}}>{inv.customerName}</div>
+        <div style={{fontSize:12,color:C.tm,marginTop:2}}>Acct: {inv.customerId}</div>
+        <div style={{fontSize:12,color:C.tm}}>{inv.customerAddress}</div>
+        {inv.customerTaxExempt&&<span style={badge(C.wn)}>Tax Exempt</span>}
+        <button style={{...btn("ghost"),padding:"8px",marginTop:8,fontSize:10}} onClick={()=>setInv(p=>({...p,customerId:"",customerName:"",customerAddress:"",customerPhone:"",customerEmail:"",customerTaxExempt:false}))}>Change Customer</button>
+      </div>
+      :<div>
+        <input style={S.inp} placeholder="Search by name or account #..." value={customerSearch} onChange={e=>{setCustomerSearch(e.target.value);setShowCL(true)}} onFocus={()=>setShowCL(true)}/>
+        {showCL&&customerSearch&&<div style={{maxHeight:200,overflowY:"auto",border:"1px solid "+C.bd,borderRadius:6,background:C.sa}}>
+          {filtered.length===0?<div style={{padding:12,color:C.td,fontSize:13}}>No customers found</div>
+          :filtered.slice(0,20).map(c=><div key={c.accountNumber} style={{padding:"10px 14px",borderBottom:"1px solid "+C.bd,cursor:"pointer"}} onClick={()=>selectCustomer(c)}>
+            <div style={{fontSize:14,fontWeight:700,color:C.tx}}>{c.name}</div>
+            <div style={{fontSize:11,color:C.tm}}>Acct: {c.accountNumber}</div>
+          </div>)}
+        </div>}
+      </div>}
+    </div>
+
+    {/* Products */}
+    <div style={S.card}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <div style={S.cardT}>Products</div>
+        <button style={{background:C.pr+"22",border:"1px solid "+C.pr,borderRadius:6,padding:"6px 12px",cursor:"pointer",display:"flex",alignItems:"center",gap:4,color:C.pr,fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",fontFamily:"inherit"}} onClick={()=>setShowAL(!showAL)}>
+          <Ic name="plus" size={14} color={C.pr}/> Add
+        </button>
+      </div>
+
+      {showAL&&<div style={{background:C.sa,borderRadius:6,padding:12,marginBottom:12,border:"1px solid "+C.bl}}>
+        <label style={S.lbl}>Product</label>
+        <select style={S.sel} value={nl.productId} onChange={e=>setNL(p=>({...p,productId:e.target.value}))}>
+          <option value="">-- Select Product --</option>
+          {products.map(p=><option key={p.id} value={p.id}>{p.shortName} - {formatCurrency(p.pricePerGallon)}/gal</option>)}
+        </select>
+        <div style={S.row}>
+          <div style={S.f1}><label style={S.lbl}>Gallons</label><input style={S.inp} type="number" step="0.1" placeholder="0.0" value={nl.gallons} onChange={e=>setNL(p=>({...p,gallons:e.target.value}))}/></div>
+          <div style={S.f1}><label style={S.lbl}>Price Override</label><input style={S.inp} type="number" step="0.001" placeholder={nl.productId?products.find(p=>p.id===nl.productId)?.pricePerGallon?.toFixed(3):"0.000"} value={nl.priceOverride} onChange={e=>setNL(p=>({...p,priceOverride:e.target.value}))}/></div>
+        </div>
+        <button style={btn("primary")} onClick={addLineItem}>Add to Invoice</button>
+      </div>}
+
+      {inv.lineItems.length===0?<div style={{textAlign:"center",padding:20,color:C.td,fontSize:13}}>No products added yet</div>
+      :inv.lineItems.map(item=><div key={item.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid "+C.bd}}>
+        <div style={{flex:1}}>
+          <div style={{fontSize:13,fontWeight:700,color:C.tx}}>{item.productName}</div>
+          <div style={{fontSize:11,color:C.tm}}>{item.gallons} gal x {formatCurrency(item.pricePerGallon)}{item.taxable?<span style={{color:C.wn}}> +tax</span>:""}</div>
+        </div>
+        <div style={{textAlign:"right",display:"flex",alignItems:"center",gap:10}}>
+          <div style={{fontSize:14,fontWeight:700,color:C.tx}}>{formatCurrency(item.lineTotal)}</div>
+          <button style={{background:"none",border:"none",cursor:"pointer",padding:4}} onClick={()=>removeLineItem(item.id)}><Ic name="trash" size={16} color={C.dn}/></button>
+        </div>
+      </div>)}
+
+      {inv.lineItems.length>0&&<div style={{marginTop:12}}>
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:C.tm,padding:"4px 0"}}><span>Subtotal</span><span>{formatCurrency(inv.subtotal)}</span></div>
+        {inv.taxTotal>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:C.wn,padding:"4px 0"}}><span>Tax (7%)</span><span>{formatCurrency(inv.taxTotal)}</span></div>}
+        <div style={S.div}/>
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:18,fontWeight:700,color:C.pr,padding:"4px 0"}}><span>Total</span><span>{formatCurrency(inv.grandTotal)}</span></div>
+      </div>}
+    </div>
+
+    {/* Delivery Details */}
+    <div style={S.card}>
+      <div style={S.cardT}>Delivery Details</div>
+      <div style={S.row}>
+        <div style={S.f1}><label style={S.lbl}>PO Number</label><input style={S.inp} placeholder="Optional" value={inv.poNumber} onChange={e=>setInv(p=>({...p,poNumber:e.target.value}))}/></div>
+        <div style={S.f1}><label style={S.lbl}>Ticket Number</label><input style={S.inp} placeholder="Optional" value={inv.ticketNumber} onChange={e=>setInv(p=>({...p,ticketNumber:e.target.value}))}/></div>
+      </div>
+      <div style={S.row}>
+        <div style={S.f1}><label style={S.lbl}>Tank Before</label><input style={S.inp} type="number" placeholder="Gallons" value={inv.tankReadingBefore} onChange={e=>setInv(p=>({...p,tankReadingBefore:e.target.value}))}/></div>
+        <div style={S.f1}><label style={S.lbl}>Tank After</label><input style={S.inp} type="number" placeholder="Gallons" value={inv.tankReadingAfter} onChange={e=>setInv(p=>({...p,tankReadingAfter:e.target.value}))}/></div>
+      </div>
+      <label style={S.lbl}>Delivery Notes</label>
+      <textarea style={{...S.inp,minHeight:60,resize:"vertical"}} placeholder="Notes..." value={inv.deliveryNotes} onChange={e=>setInv(p=>({...p,deliveryNotes:e.target.value}))}/>
+    </div>
+
+    {/* Payment */}
+    <div style={S.card}>
+      <div style={S.cardT}>Payment</div>
+      <div style={{display:"flex",gap:8,marginBottom:12}}>
+        {["invoice","paid"].map(s=><button key={s} style={{flex:1,padding:"10px",borderRadius:6,border:"1px solid "+(inv.paymentStatus===s?C.pr:C.bd),background:inv.paymentStatus===s?C.pr+"22":"transparent",color:inv.paymentStatus===s?C.pr:C.td,fontSize:12,fontWeight:700,letterSpacing:1,textTransform:"uppercase",cursor:"pointer",fontFamily:"inherit"}} onClick={()=>setInv(p=>({...p,paymentStatus:s}))}>{s==="invoice"?"Bill Later":"Paid Now"}</button>)}
+      </div>
+      {inv.paymentStatus==="paid"&&<div style={S.row}>
+        <div style={S.f1}><label style={S.lbl}>Method</label><select style={S.sel} value={inv.paymentMethod} onChange={e=>setInv(p=>({...p,paymentMethod:e.target.value}))}><option value="">Select</option><option value="cash">Cash</option><option value="check">Check</option><option value="card">Card</option></select></div>
+        <div style={S.f1}><label style={S.lbl}>Ref / Check #</label><input style={S.inp} placeholder="Optional" value={inv.paymentRef} onChange={e=>setInv(p=>({...p,paymentRef:e.target.value}))}/></div>
+      </div>}
+    </div>
+
+    {/* Signature */}
+    <div style={S.card}>
+      <div style={S.cardT}>Customer Signature</div>
+      <SignaturePad value={inv.signature} onChange={(sig)=>setInv(p=>({...p,signature:sig}))}/>
+    </div>
+
+    {/* Actions */}
+    <div style={{padding:"0 16px 16px",display:"flex",flexDirection:"column",gap:8}}>
+      <button style={btn("primary")} onClick={handleSave}>Save Invoice</button>
+      <button style={btn("outline")} onClick={()=>setInv(emptyInv())}>Clear / New Invoice</button>
+    </div>
+  </div>;
+}
+
+// ═══ HISTORY ═══
+function HistoryPage({invoices,subPage,setSubPage}){
+  const[search,setSearch]=useState("");
+  const sorted=[...invoices].sort((a,b)=>new Date(b.date)-new Date(a.date));
+  const filtered=sorted.filter(inv=>inv.invoiceNumber.toLowerCase().includes(search.toLowerCase())||inv.customerName.toLowerCase().includes(search.toLowerCase())||inv.customerId.toLowerCase().includes(search.toLowerCase()));
+
+  if(subPage){
+    const inv=invoices.find(i=>i.invoiceNumber===subPage);
+    if(!inv)return <div style={S.card}>Invoice not found</div>;
+    return <InvoiceDetail invoice={inv}/>;
+  }
+
+  return <div>
+    <div style={{padding:"12px 16px"}}><input style={S.inp} placeholder="Search invoices..." value={search} onChange={e=>setSearch(e.target.value)}/></div>
+    {filtered.length===0?<div style={{...S.card,textAlign:"center",color:C.td}}>No invoices found</div>
+    :filtered.map(inv=><div key={inv.invoiceNumber} style={{...S.card,cursor:"pointer"}} onClick={()=>setSubPage(inv.invoiceNumber)}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div>
+          <div style={{fontSize:14,fontWeight:700,color:C.pr}}>{inv.invoiceNumber}</div>
+          <div style={{fontSize:13,color:C.tx,marginTop:2}}>{inv.customerName}</div>
+          <div style={{fontSize:11,color:C.tm}}>{formatDateTime(inv.date)}</div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:16,fontWeight:700,color:C.tx}}>{formatCurrency(inv.grandTotal)}</div>
+          <span style={badge(inv.paymentStatus==="paid"?C.ok:C.wn)}>{inv.paymentStatus==="paid"?"Paid":"Invoiced"}</span>
+        </div>
+      </div>
+    </div>)}
+  </div>;
+}
+
+function InvoiceDetail({invoice:inv}){
+  return <div>
+    <div style={S.card}>
+      <div style={{textAlign:"center",marginBottom:16}}>
+        <div style={{fontSize:20,fontWeight:700,color:C.pr,letterSpacing:3}}>BARBER OIL</div>
+        <div style={{fontSize:10,color:C.tm,letterSpacing:2}}>HOHENWALD, TENNESSEE</div>
+      </div>
+      <div style={S.div}/>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:12}}>
+        <div><div style={{fontSize:10,color:C.td,textTransform:"uppercase",letterSpacing:1}}>Invoice #</div><div style={{fontSize:14,fontWeight:700}}>{inv.invoiceNumber}</div></div>
+        <div style={{textAlign:"right"}}><div style={{fontSize:10,color:C.td,textTransform:"uppercase",letterSpacing:1}}>Date</div><div style={{fontSize:13}}>{formatDateTime(inv.date)}</div></div>
+      </div>
+      <div style={{marginBottom:12}}>
+        <div style={{fontSize:10,color:C.td,textTransform:"uppercase",letterSpacing:1}}>Customer</div>
+        <div style={{fontSize:14,fontWeight:700}}>{inv.customerName}</div>
+        <div style={{fontSize:12,color:C.tm}}>Acct: {inv.customerId}</div>
+        <div style={{fontSize:12,color:C.tm}}>{inv.customerAddress}</div>
+      </div>
+      <div style={{fontSize:11,color:C.tm}}>Driver: {inv.driverName}</div>
+    </div>
+
+    <div style={S.card}>
+      <div style={S.cardT}>Line Items</div>
+      {inv.lineItems.map((item,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid "+C.bd}}>
+        <div><div style={{fontSize:13,fontWeight:700}}>{item.productName}</div><div style={{fontSize:11,color:C.tm}}>{item.gallons} gal x {formatCurrency(item.pricePerGallon)}{item.taxable?" +tax":""}</div></div>
+        <div style={{fontSize:14,fontWeight:700}}>{formatCurrency(item.lineTotal)}</div>
+      </div>)}
+      <div style={{marginTop:12}}>
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:C.tm}}><span>Subtotal</span><span>{formatCurrency(inv.subtotal)}</span></div>
+        {inv.taxTotal>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:C.wn}}><span>Tax (7%)</span><span>{formatCurrency(inv.taxTotal)}</span></div>}
+        <div style={S.div}/>
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:18,fontWeight:700,color:C.pr}}><span>Total</span><span>{formatCurrency(inv.grandTotal)}</span></div>
+      </div>
+    </div>
+
+    {(inv.poNumber||inv.ticketNumber||inv.tankReadingBefore||inv.tankReadingAfter||inv.deliveryNotes)&&<div style={S.card}>
+      <div style={S.cardT}>Delivery Details</div>
+      {inv.poNumber&&<div style={{fontSize:12,color:C.tm,marginBottom:4}}>PO: {inv.poNumber}</div>}
+      {inv.ticketNumber&&<div style={{fontSize:12,color:C.tm,marginBottom:4}}>Ticket: {inv.ticketNumber}</div>}
+      {inv.tankReadingBefore&&<div style={{fontSize:12,color:C.tm,marginBottom:4}}>Tank Before: {inv.tankReadingBefore} gal</div>}
+      {inv.tankReadingAfter&&<div style={{fontSize:12,color:C.tm,marginBottom:4}}>Tank After: {inv.tankReadingAfter} gal</div>}
+      {inv.deliveryNotes&&<div style={{fontSize:12,color:C.tm}}>{inv.deliveryNotes}</div>}
+    </div>}
+
+    <div style={S.card}>
+      <span style={badge(inv.paymentStatus==="paid"?C.ok:C.wn)}>
+        {inv.paymentStatus==="paid"?"Paid - "+inv.paymentMethod+(inv.paymentRef?" #"+inv.paymentRef:""):"Invoice - Bill Later"}
+      </span>
+      {inv.signature&&<div style={{marginTop:12}}>
+        <div style={{fontSize:10,color:C.td,textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>Customer Signature</div>
+        <img src={inv.signature} alt="Signature" style={{width:"100%",maxHeight:80,objectFit:"contain",background:C.sa,borderRadius:6,padding:8}}/>
+      </div>}
+    </div>
+  </div>;
+}
+
+// ═══ CUSTOMERS ═══
+function CustomersPage({customers,onRefresh,showToast,subPage,setSubPage,isAdmin}){
+  const[search,setSearch]=useState("");
+  const[showAdd,setShowAdd]=useState(false);
+  const[showImport,setShowImport]=useState(false);
+  const[editCustomer,setEditCustomer]=useState(null);
+  const filtered=customers.filter(c=>c.name.toLowerCase().includes(search.toLowerCase())||c.accountNumber.toLowerCase().includes(search.toLowerCase())).sort((a,b)=>a.name.localeCompare(b.name));
+
+  if(editCustomer||showAdd){
+    return <CustomerForm customer={editCustomer} onSave={async(c)=>{await dbPut("customers",c);await onRefresh();showToast(editCustomer?"Customer updated!":"Customer added!");setEditCustomer(null);setShowAdd(false)}} onCancel={()=>{setEditCustomer(null);setShowAdd(false)}}/>;
+  }
+
+  return <div>
+    <div style={{padding:"12px 16px",display:"flex",gap:8}}>
+      <input style={{...S.inp,flex:1,marginBottom:0}} placeholder="Search customers..." value={search} onChange={e=>setSearch(e.target.value)}/>
+      <button style={{...btn("primary"),width:"auto",padding:"12px"}} onClick={()=>setShowAdd(true)}><Ic name="plus" size={18} color={C.bg}/></button>
+    </div>
+    {isAdmin&&<div style={{padding:"0 16px 8px"}}>
+      <button style={{...btn("outline"),fontSize:10,padding:"8px 12px"}} onClick={()=>setShowImport(!showImport)}>
+        <span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6}}><Ic name="upload" size={14} color={C.pr}/> Import from CSV</span>
+      </button>
+      {showImport&&<CSVImport onImport={async(rows)=>{for(const row of rows){const cust=mapCSVToCustomer(row);if(cust.name)await dbPut("customers",cust)}await onRefresh();setShowImport(false);showToast("Imported "+rows.length+" customers!")}}/>}
+    </div>}
+    <div style={{padding:"0 16px 8px",fontSize:11,color:C.td}}>{filtered.length} customers</div>
+    {filtered.map(c=><div key={c.accountNumber} style={{...S.card,cursor:"pointer"}} onClick={()=>setEditCustomer(c)}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div><div style={{fontSize:14,fontWeight:700,color:C.tx}}>{c.name}</div><div style={{fontSize:11,color:C.tm}}>Acct: {c.accountNumber}</div>{c.phone&&<div style={{fontSize:11,color:C.td}}>{c.phone}</div>}</div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>{c.taxExempt&&<span style={badge(C.wn)}>Exempt</span>}<Ic name="edit" size={16} color={C.td}/></div>
+      </div>
+    </div>)}
+  </div>;
+}
+
+function CustomerForm({customer,onSave,onCancel}){
+  const[form,setForm]=useState(customer||{accountNumber:"",name:"",address:"",city:"",state:"",zip:"",phone:"",email:"",taxExempt:false,notes:""});
+  const u=(f,v)=>setForm(p=>({...p,[f]:v}));
+  return <div><div style={S.card}>
+    <div style={S.cardT}>{customer?"Edit Customer":"New Customer"}</div>
+    <label style={S.lbl}>Account Number *</label><input style={S.inp} value={form.accountNumber} onChange={e=>u("accountNumber",e.target.value)} placeholder="Account #" disabled={!!customer}/>
+    <label style={S.lbl}>Name *</label><input style={S.inp} value={form.name} onChange={e=>u("name",e.target.value)} placeholder="Customer name"/>
+    <label style={S.lbl}>Address</label><input style={S.inp} value={form.address} onChange={e=>u("address",e.target.value)} placeholder="Street address"/>
+    <div style={S.row}>
+      <div style={S.f1}><label style={S.lbl}>City</label><input style={S.inp} value={form.city} onChange={e=>u("city",e.target.value)}/></div>
+      <div style={{width:60}}><label style={S.lbl}>State</label><input style={S.inp} value={form.state} onChange={e=>u("state",e.target.value)} maxLength={2}/></div>
+      <div style={{width:80}}><label style={S.lbl}>Zip</label><input style={S.inp} value={form.zip} onChange={e=>u("zip",e.target.value)}/></div>
+    </div>
+    <label style={S.lbl}>Phone</label><input style={S.inp} value={form.phone} onChange={e=>u("phone",e.target.value)} type="tel" placeholder="Phone"/>
+    <label style={S.lbl}>Email</label><input style={S.inp} value={form.email} onChange={e=>u("email",e.target.value)} type="email" placeholder="Email"/>
+    <label style={{...S.lbl,display:"flex",alignItems:"center",gap:8,marginBottom:12,cursor:"pointer"}}><input type="checkbox" checked={form.taxExempt} onChange={e=>u("taxExempt",e.target.checked)}/> Tax Exempt</label>
+    <label style={S.lbl}>Notes</label><textarea style={{...S.inp,minHeight:50,resize:"vertical"}} value={form.notes} onChange={e=>u("notes",e.target.value)} placeholder="Notes..."/>
+    <div style={{display:"flex",gap:8}}>
+      <button style={{...btn("ghost"),flex:1}} onClick={onCancel}>Cancel</button>
+      <button style={{...btn("primary"),flex:2}} onClick={()=>{if(!form.accountNumber||!form.name){alert("Account number and name required");return}onSave(form)}}>Save</button>
+    </div>
+  </div></div>;
+}
+
+function CSVImport({onImport}){
+  const fileRef=useRef();
+  const handleFile=(e)=>{const file=e.target.files[0];if(!file)return;const reader=new FileReader();reader.onload=(ev)=>{onImport(parseCSV(ev.target.result))};reader.readAsText(file)};
+  return <div style={{background:C.sa,borderRadius:6,padding:12,marginTop:8,border:"1px solid "+C.bl}}>
+    <div style={{fontSize:11,color:C.tm,marginBottom:8}}>CSV headers: AccountNumber, Name, Address, City, State, Zip, Phone, Email, TaxExempt</div>
+    <input type="file" accept=".csv" ref={fileRef} onChange={handleFile} style={{fontSize:12,color:C.tx}}/>
+  </div>;
+}
+
+// ═══ PRODUCTS ═══
+function ProductsPage({products,onRefresh,showToast}){
+  const[editing,setEditing]=useState(null);
+  const[price,setPrice]=useState("");
+  const savePrice=async(prod)=>{await dbPut("products",{...prod,pricePerGallon:parseFloat(price)||0});await onRefresh();setEditing(null);showToast("Price updated!")};
+
+  return <div>
+    <div style={{padding:"16px 16px 8px"}}><div style={{fontSize:11,letterSpacing:2,textTransform:"uppercase",color:C.pr,fontWeight:700}}>Product Pricing</div><div style={{fontSize:11,color:C.td,marginTop:4}}>Tap a product to update price</div></div>
+    {products.map(p=><div key={p.id} style={S.card}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{flex:1}}>
+          <div style={{fontSize:14,fontWeight:700,color:C.tx}}>{p.shortName}</div>
+          <div style={{fontSize:11,color:C.td}}>{p.name}</div>
+          {p.taxable&&<span style={badge(C.wn)}>7% Tax</span>}
+        </div>
+        {editing===p.id?<div style={{display:"flex",alignItems:"center",gap:6}}>
+          <span style={{color:C.tm,fontSize:16}}>$</span>
+          <input style={{...S.inp,width:80,marginBottom:0,textAlign:"right"}} type="number" step="0.001" value={price} onChange={e=>setPrice(e.target.value)} onKeyDown={e=>e.key==="Enter"&&savePrice(p)} autoFocus/>
+          <button style={{background:C.ok,border:"none",borderRadius:6,padding:8,cursor:"pointer"}} onClick={()=>savePrice(p)}><Ic name="check" size={16} color={C.wh}/></button>
+        </div>
+        :<div style={{cursor:"pointer",textAlign:"right"}} onClick={()=>{setEditing(p.id);setPrice(p.pricePerGallon.toString())}}>
+          <div style={{fontSize:20,fontWeight:700,color:C.pr}}>{formatCurrency(p.pricePerGallon)}</div>
+          <div style={{fontSize:10,color:C.td}}>per gallon</div>
+        </div>}
+      </div>
+    </div>)}
+  </div>;
+}
+
+// ═══ DASHBOARD ═══
+function DashboardPage({invoices,products,customers,users}){
+  const today=new Date().toDateString();
+  const ti=invoices.filter(i=>new Date(i.date).toDateString()===today);
+  const tr=ti.reduce((s,i)=>s+i.grandTotal,0);
+  const tg=ti.reduce((s,i)=>s+i.lineItems.reduce((g,l)=>g+l.gallons,0),0);
+  const totalRev=invoices.reduce((s,i)=>s+i.grandTotal,0);
+  const unpaid=invoices.filter(i=>i.paymentStatus==="invoice");
+  const unpaidTotal=unpaid.reduce((s,i)=>s+i.grandTotal,0);
+  const gbp={};
+  invoices.forEach(inv=>{inv.lineItems.forEach(li=>{gbp[li.productName]=(gbp[li.productName]||0)+li.gallons})});
+
+  return <div>
+    <div style={{padding:"16px 16px 0"}}><div style={{fontSize:11,letterSpacing:2,textTransform:"uppercase",color:C.pr,fontWeight:700}}>Dashboard</div></div>
+    <div style={{display:"flex",gap:12,padding:"12px 16px"}}>
+      <div style={{...S.card,flex:1,margin:0,textAlign:"center"}}><div style={{fontSize:10,color:C.td,textTransform:"uppercase",letterSpacing:1}}>Today</div><div style={{fontSize:22,fontWeight:700,color:C.pr}}>{formatCurrency(tr)}</div><div style={{fontSize:11,color:C.tm}}>{ti.length} invoices</div></div>
+      <div style={{...S.card,flex:1,margin:0,textAlign:"center"}}><div style={{fontSize:10,color:C.td,textTransform:"uppercase",letterSpacing:1}}>Today Gal</div><div style={{fontSize:22,fontWeight:700,color:C.tx}}>{tg.toFixed(1)}</div><div style={{fontSize:11,color:C.tm}}>gallons</div></div>
+    </div>
+    <div style={{display:"flex",gap:12,padding:"0 16px"}}>
+      <div style={{...S.card,flex:1,margin:0,textAlign:"center"}}><div style={{fontSize:10,color:C.td,textTransform:"uppercase",letterSpacing:1}}>Total Revenue</div><div style={{fontSize:18,fontWeight:700,color:C.tx}}>{formatCurrency(totalRev)}</div></div>
+      <div style={{...S.card,flex:1,margin:0,textAlign:"center"}}><div style={{fontSize:10,color:C.td,textTransform:"uppercase",letterSpacing:1}}>Outstanding</div><div style={{fontSize:18,fontWeight:700,color:C.dn}}>{formatCurrency(unpaidTotal)}</div><div style={{fontSize:11,color:C.tm}}>{unpaid.length} unpaid</div></div>
+    </div>
+    <div style={{...S.card,marginTop:12}}>
+      <div style={S.cardT}>Gallons by Product</div>
+      {Object.entries(gbp).sort((a,b)=>b[1]-a[1]).map(([name,gal])=><div key={name} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid "+C.bd}}><span style={{fontSize:13,color:C.tx}}>{name}</span><span style={{fontSize:13,fontWeight:700,color:C.pr}}>{gal.toFixed(1)} gal</span></div>)}
+      {Object.keys(gbp).length===0&&<div style={{fontSize:13,color:C.td,textAlign:"center",padding:12}}>No deliveries yet</div>}
+    </div>
+    <div style={S.card}>
+      <div style={S.cardT}>System</div>
+      <div style={{fontSize:13,color:C.tm,marginBottom:4}}>Customers: {customers.length}</div>
+      <div style={{fontSize:13,color:C.tm,marginBottom:4}}>Total Invoices: {invoices.length}</div>
+      <div style={{fontSize:13,color:C.tm}}>Drivers: {users.filter(u=>u.role==="driver").length}</div>
+    </div>
+  </div>;
+}
+
+// ═══ SETTINGS ═══
+function SettingsPage({users,onRefresh,showToast}){
+  const[showAddUser,setShowAddUser]=useState(false);
+  const[newUser,setNewUser]=useState({id:"",name:"",pin:"",role:"driver"});
+  const addUser=async()=>{if(!newUser.id||!newUser.name||!newUser.pin){alert("All fields required");return}await dbPut("users",newUser);await onRefresh();setNewUser({id:"",name:"",pin:"",role:"driver"});setShowAddUser(false);showToast("User added!")};
+  const removeUser=async(id)=>{if(!confirm("Remove this user?"))return;await dbDelete("users",id);await onRefresh();showToast("User removed")};
+
+  const exportInvoices=async()=>{
+    const invs=await dbGetAll("invoices");
+    if(invs.length===0){alert("No invoices to export");return}
+    const headers=["InvoiceNumber","Date","CustomerName","AccountNumber","Product","Gallons","PricePerGallon","LineTotal","Tax","GrandTotal","PaymentStatus","Driver"];
+    const rows=[];
+    invs.forEach(inv=>{inv.lineItems.forEach(li=>{rows.push([inv.invoiceNumber,inv.date,inv.customerName,inv.customerId,li.productName,li.gallons,li.pricePerGallon,li.lineTotal,li.lineTax,inv.grandTotal,inv.paymentStatus,inv.driverName].join(","))})});
+    const csv=[headers.join(","),...rows].join("\n");
+    const blob=new Blob([csv],{type:"text/csv"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;a.download="barber-oil-invoices-"+new Date().toISOString().slice(0,10)+".csv";a.click();
+    URL.revokeObjectURL(url);showToast("Exported!");
+  };
+
+  return <div>
+    <div style={{padding:"16px 16px 0"}}><div style={{fontSize:11,letterSpacing:2,textTransform:"uppercase",color:C.pr,fontWeight:700}}>Settings</div></div>
+    <div style={S.card}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <div style={S.cardT}>Drivers / Users</div>
+        <button style={{background:C.pr+"22",border:"1px solid "+C.pr,borderRadius:6,padding:"6px 12px",cursor:"pointer",color:C.pr,fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",fontFamily:"inherit"}} onClick={()=>setShowAddUser(!showAddUser)}>Add</button>
+      </div>
+      {showAddUser&&<div style={{background:C.sa,borderRadius:6,padding:12,marginBottom:12,border:"1px solid "+C.bl}}>
+        <div style={S.row}><div style={S.f1}><label style={S.lbl}>User ID</label><input style={S.inp} value={newUser.id} onChange={e=>setNewUser(p=>({...p,id:e.target.value}))} placeholder="driver2"/></div><div style={S.f1}><label style={S.lbl}>Name</label><input style={S.inp} value={newUser.name} onChange={e=>setNewUser(p=>({...p,name:e.target.value}))} placeholder="John"/></div></div>
+        <div style={S.row}><div style={S.f1}><label style={S.lbl}>PIN</label><input style={S.inp} value={newUser.pin} onChange={e=>setNewUser(p=>({...p,pin:e.target.value}))} placeholder="1234" maxLength={6}/></div><div style={S.f1}><label style={S.lbl}>Role</label><select style={S.sel} value={newUser.role} onChange={e=>setNewUser(p=>({...p,role:e.target.value}))}><option value="driver">Driver</option><option value="admin">Admin</option></select></div></div>
+        <button style={btn("primary")} onClick={addUser}>Save User</button>
+      </div>}
+      {users.map(u=><div key={u.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid "+C.bd}}>
+        <div><div style={{fontSize:14,fontWeight:700,color:C.tx}}>{u.name}</div><div style={{fontSize:11,color:C.tm}}>{u.id} - {u.role} - PIN: {u.pin}</div></div>
+        <button style={{background:"none",border:"none",cursor:"pointer",padding:4}} onClick={()=>removeUser(u.id)}><Ic name="trash" size={16} color={C.dn}/></button>
+      </div>)}
+    </div>
+    <div style={S.card}><div style={S.cardT}>Data Export</div><div style={{fontSize:12,color:C.tm,marginBottom:12}}>Export all invoices as CSV for Sage 100</div><button style={btn("outline")} onClick={exportInvoices}>Export Invoices to CSV</button></div>
+    <div style={{...S.card,borderColor:C.dn+"44"}}>
+      <div style={{...S.cardT,color:C.dn}}>Danger Zone</div>
+      <button style={{...btn("danger"),marginBottom:8}} onClick={async()=>{if(!confirm("Clear ALL invoices?"))return;await dbClear("invoices");await onRefresh();showToast("Invoices cleared")}}>Clear All Invoices</button>
+      <button style={btn("danger")} onClick={async()=>{if(!confirm("Clear ALL customers?"))return;await dbClear("customers");await onRefresh();showToast("Customers cleared")}}>Clear All Customers</button>
+    </div>
+  </div>;
+}
+
+// Render
+ReactDOM.createRoot(document.getElementById("root")).render(<BarberOilApp/>);
+</script>
+</body>
+</html>
